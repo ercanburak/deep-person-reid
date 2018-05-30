@@ -6,7 +6,7 @@ import datetime
 import argparse
 import os.path as osp
 import numpy as np
-import heapq
+import random
 
 import torch
 import torch.nn as nn
@@ -66,7 +66,7 @@ parser.add_argument('--num-instances', type=int, default=4,
 parser.add_argument('--htri-only', action='store_true', default=False,
                     help="if this is True, only htri loss is used in training")
 # Hard Triplet Mining Options
-parser.add_argument('--htmn', default=5000, type=int,
+parser.add_argument('--htmn', default=64, type=int,
 					help="Number of randomly selected example images for hard triplet mining")
 parser.add_argument('--htmk', default=16, type=int,
 					help="Number of iterations with same example image set")
@@ -125,18 +125,18 @@ def main():
 
     pin_memory = True if use_gpu else False
 
+
     trainloader = DataLoader(
         ImageDataset(dataset.train, transform=transform_train),
         sampler=RandomIdentitySampler(dataset.train, num_instances=args.num_instances),
         batch_size=args.train_batch, num_workers=args.workers,
         pin_memory=pin_memory, drop_last=True,
     )
-
     """
+
     trainloader = DataLoader(
         ImageDataset(dataset.train, transform=transform_train),
-        sampler=RandomSamplerDoneRight(dataset.train, k=args.htmk),
-        batch_size=args.htmn, num_workers=args.workers,
+        batch_size=args.htmn, num_workers=args.workers, shuffle=True,
         pin_memory=pin_memory, drop_last=True,
     )
     """
@@ -158,8 +158,8 @@ def main():
     print("Model size: {:.5f}M".format(sum(p.numel() for p in model.parameters())/1000000.0))
 
     criterion_xent = CrossEntropyLabelSmooth(num_classes=dataset.num_train_pids, use_gpu=use_gpu)
-    criterion_htri = TripletLoss(margin=args.margin)
-    
+    criterion_htri = TripletLossDoneRight(margin=args.margin, bs=args.train_batch)
+
     optimizer = init_optim(args.optim, model.parameters(), args.lr, args.weight_decay)
     if args.stepsize > 0:
         scheduler = lr_scheduler.StepLR(optimizer, step_size=args.stepsize, gamma=args.gamma)
@@ -189,9 +189,9 @@ def main():
         start_train_time = time.time()
         train(epoch, model, criterion_xent, criterion_htri, optimizer, trainloader, use_gpu)
         train_time += round(time.time() - start_train_time)
-        
+
         if args.stepsize > 0: scheduler.step()
-        
+
         if args.eval_step > 0 and (epoch+1) % args.eval_step == 0 or (epoch+1) == args.max_epoch:
             print("==> Test")
             rank1 = test(model, queryloader, galleryloader, use_gpu)
@@ -225,67 +225,80 @@ def train(epoch, model, criterion_xent, criterion_htri, optimizer, trainloader, 
     model.train()
 
     end = time.time()
-	
-    (imgs, pids, _) = next(iter(trainloader))
-    if use_gpu:
-        imgs, pids = imgs.cuda(), pids.cuda()
-    outputs, features = model(imgs)
-	
-    n = features.size(0) #args.htmn
-    # Compute pairwise distance, replace by the official when merged
-    dist = torch.pow(features, 2).sum(dim=1, keepdim=True).expand(n, n)
-    dist = dist + dist.t()
-    dist.addmm_(1, -2, features, features.t())
-    dist = dist.clamp(min=1e-12).sqrt()  # for numerical stability
-    mask = pids.expand(n, n).eq(pids.expand(n, n).t())
-    
-    #Compute losses for all triplets
-    
-    for batch_idx in range(args.htmk):
-        # measure data loading time
-        data_time.update(time.time() - end)
-        
-        batch_indices = torch.randperm(args.htmn)[:args.batch_size]
-        
-        #for i in batch_indices:
-            # 5000 örnek için distance değil de tüm tripletler için loss hesaplanmalı
-            # hardest pos ve neg bulunmayacak, 25 highest loss bulunacak
-	
-        if args.htri_only:
-            if isinstance(features, tuple):
-                loss = DeepSupervision(criterion_htri, features, pids)
+
+    for _, (imgs, pids, _) in enumerate(trainloader):
+
+        # (imgs, pids, _) = next(iter(trainloader))
+        if use_gpu:
+            imgs, pids = imgs.cuda(), pids.cuda()
+        outputs, features = model(imgs)
+
+        n = features.size(0)  # args.htmn
+        # Compute pairwise distance, replace by the official when merged
+        dist = torch.pow(features, 2).sum(dim=1, keepdim=True).expand(n, n)
+        dist = dist + dist.t()
+        dist.addmm_(1, -2, features, features.t())
+        dist = dist.clamp(min=1e-12).sqrt()  # for numerical stability
+        mask = pids.expand(n, n).eq(pids.expand(n, n).t())
+
+        # Compute losses for all triplets
+        # This tensor holds loss like values
+        # Loss like = no margin, no max
+        # Invalid triplets are zero
+        # Lossless triplets are negative
+        # Lossy triplets are positive
+        loss_like = torch.zeros([n, n, n])
+        for anc in range(n):
+            for pos in range(n):
+                if mask[anc, pos] == 1 and anc != pos:
+                    for neg in range(n):
+                        if mask[anc, neg] == 0:
+                            loss_like[anc, pos, neg] = dist[anc][pos] - dist[anc][neg]
+
+        for batch_idx in range(args.htmk):
+            # measure data loading time
+            data_time.update(time.time() - end)
+
+            """
+            if args.htri_only:
+                if isinstance(features, tuple):
+                    loss = DeepSupervision(criterion_htri, features, pids)
+                else:
+                    loss = criterion_htri(features, pids)
             else:
-                loss = criterion_htri(features, pids)
-        else:
-            if isinstance(outputs, tuple):
-                xent_loss = DeepSupervision(criterion_xent, outputs, pids)
-            else:
-                xent_loss = criterion_xent(outputs, pids)
-            
-            if isinstance(features, tuple):
-                htri_loss = DeepSupervision(criterion_htri, features, pids)
-            else:
-                htri_loss = criterion_htri(features, pids)
-            loss = xent_loss + htri_loss
-		
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+                if isinstance(outputs, tuple):
+                    xent_loss = DeepSupervision(criterion_xent, outputs, pids)
+                else:
+                    xent_loss = criterion_xent(outputs, pids)
 
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
+                if isinstance(features, tuple):
+                    htri_loss = DeepSupervision(criterion_htri, features, pids)
+                else:
+                    htri_loss = criterion_htri(features, pids)
+                loss = xent_loss + htri_loss
+            """
 
-        losses.update(loss.item(), pids.size(0))
+            loss = criterion_htri(dist, loss_like)
 
-        if (batch_idx+1) % args.print_freq == 0:
-            print('Epoch: [{0}][{1}/{2}]\t'
-                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                  'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'.format(
-                   epoch+1, batch_idx+1, len(trainloader), batch_time=batch_time,
-                   data_time=data_time, loss=losses))
+            optimizer.zero_grad()
+            loss.backward(retain_graph=True)
+            optimizer.step()
 
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            losses.update(loss.item(), pids.size(0))
+
+            if (batch_idx+1) % args.print_freq == 0:
+                print('Epoch: [{0}][{1}/{2}]\t'
+                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                      'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'.format(
+                       epoch+1, batch_idx+1, len(trainloader), batch_time=batch_time,
+                       data_time=data_time, loss=losses))
+
+        break
 
 def test(model, queryloader, galleryloader, use_gpu, ranks=[1, 5, 10, 20]):
     batch_time = AverageMeter()
@@ -316,7 +329,7 @@ def test(model, queryloader, galleryloader, use_gpu, ranks=[1, 5, 10, 20]):
         for batch_idx, (imgs, pids, camids) in enumerate(galleryloader):
             if use_gpu:
                 imgs = imgs.cuda()
-            
+
             end = time.time()
             features = model(imgs)
             batch_time.update(time.time() - end)
@@ -330,7 +343,7 @@ def test(model, queryloader, galleryloader, use_gpu, ranks=[1, 5, 10, 20]):
         g_camids = np.asarray(g_camids)
 
         print("Extracted features for gallery set, obtained {}-by-{} matrix".format(gf.size(0), gf.size(1)))
-    
+
     print("==> BatchTime(s)/BatchSize(img): {:.3f}/{}".format(batch_time.avg, args.test_batch))
 
     m, n = qf.size(0), gf.size(0)
