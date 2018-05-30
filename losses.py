@@ -10,7 +10,7 @@ Shorthands for loss:
 - TripletLoss: htri
 - CenterLoss: cent
 """
-__all__ = ['DeepSupervision', 'CrossEntropyLabelSmooth', 'TripletLoss', 'CenterLoss', 'RingLoss']
+__all__ = ['DeepSupervision', 'CrossEntropyLabelSmooth', 'TripletLoss', 'TripletLossDoneRight', 'CenterLoss', 'RingLoss']
 
 def DeepSupervision(criterion, xs, y):
     """
@@ -96,6 +96,34 @@ class TripletLoss(nn.Module):
         loss = self.ranking_loss(dist_an, dist_ap, y)
         return loss
 
+class TripletLossDoneRight(nn.Module):
+    """Triplet loss as in Re-ID done right.
+	
+	1) N random examples are selected (Same N examples are used for k iterations)
+	2) Loss is computed for all possible triplets
+	3) One image is randomly selected as query
+	4) 25 triplets with the highest loss are determined 
+	5) One triplet is randomly selected among 25 triplets
+
+    Reference:
+    Almazan et al. Re-ID done right: towards good practices for person re-identification. arXiv:1801.05339.
+
+    Args:
+        margin (float): margin for triplet.
+    """
+    def __init__(self, margin=0.1, k=16):
+        super(TripletLossDoneRight, self).__init__()
+        self.margin = margin
+        self.k = k
+        self.ranking_loss = nn.MarginRankingLoss(margin=margin)
+
+    def forward(self, inputs, targets):
+        """
+        Args:
+            inputs: feature matrix with shape (batch_size, feat_dim)
+            targets: ground truth labels with shape (num_classes)
+        """
+        
 class CenterLoss(nn.Module):
     """Center loss.
     

@@ -38,3 +38,32 @@ class RandomIdentitySampler(Sampler):
 
     def __len__(self):
         return self.num_identities * self.num_instances
+		
+class RandomSamplerDoneRight(Sampler):
+    """
+	Select N random examples (Same N examples are used for k iterations)
+
+    Args:
+        data_source (Dataset): dataset to sample from.
+		k: Same N examples are used for k iterations
+    """
+    def __init__(self, data_source, k=16):
+        self.data_source = data_source
+        self.num_examples = len(data_source)
+		#self.k = k
+        self.index_dic = defaultdict(list)
+        for index, (_, pid, _) in enumerate(data_source):
+            self.index_dic[index].append(pid)
+        #self.pids = list(self.index_dic.keys())
+        #self.num_identities = len(self.pids)
+		#self.iter_counter = 0 # Count the iterations, since same N examples will be used for k iterations
+		
+    def __iter__(self):	
+		#if self.iter_counter % self.k == 0:
+        self.indices = torch.randperm(self.num_examples)
+		#self.iter_counter += 1
+        ret = self.index_dic[self.indices]
+        return iter(ret)
+		
+    def __len__(self):
+        return self.num_examples

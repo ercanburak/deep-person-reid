@@ -6,6 +6,7 @@ import datetime
 import argparse
 import os.path as osp
 import numpy as np
+import heapq
 
 import torch
 import torch.nn as nn
@@ -17,10 +18,10 @@ import data_manager
 from dataset_loader import ImageDataset
 import transforms as T
 import models
-from losses import CrossEntropyLabelSmooth, TripletLoss, DeepSupervision
+from losses import CrossEntropyLabelSmooth, TripletLoss, DeepSupervision, TripletLossDoneRight
 from utils import AverageMeter, Logger, save_checkpoint
 from eval_metrics import evaluate
-from samplers import RandomIdentitySampler
+from samplers import RandomIdentitySampler, RandomSamplerDoneRight
 from optimizers import init_optim
 
 parser = argparse.ArgumentParser(description='Train image model with cross entropy loss and hard triplet loss')
@@ -64,6 +65,11 @@ parser.add_argument('--num-instances', type=int, default=4,
                     help="number of instances per identity")
 parser.add_argument('--htri-only', action='store_true', default=False,
                     help="if this is True, only htri loss is used in training")
+# Hard Triplet Mining Options
+parser.add_argument('--htmn', default=5000, type=int,
+					help="Number of randomly selected example images for hard triplet mining")
+parser.add_argument('--htmk', default=16, type=int,
+					help="Number of iterations with same example image set")
 # Architecture
 parser.add_argument('-a', '--arch', type=str, default='resnet50', choices=models.get_names())
 # Miscs
@@ -108,13 +114,13 @@ def main():
         T.Random2DTranslation(args.height, args.width),
         T.RandomHorizontalFlip(),
         T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), # These are for ImageNet Dataset
     ])
 
     transform_test = T.Compose([
         T.Resize((args.height, args.width)),
         T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), # These are for ImageNet Dataset
     ])
 
     pin_memory = True if use_gpu else False
@@ -125,6 +131,15 @@ def main():
         batch_size=args.train_batch, num_workers=args.workers,
         pin_memory=pin_memory, drop_last=True,
     )
+
+    """
+    trainloader = DataLoader(
+        ImageDataset(dataset.train, transform=transform_train),
+        sampler=RandomSamplerDoneRight(dataset.train, k=args.htmk),
+        batch_size=args.htmn, num_workers=args.workers,
+        pin_memory=pin_memory, drop_last=True,
+    )
+    """
 
     queryloader = DataLoader(
         ImageDataset(dataset.query, transform=transform_test),
@@ -210,13 +225,32 @@ def train(epoch, model, criterion_xent, criterion_htri, optimizer, trainloader, 
     model.train()
 
     end = time.time()
-    for batch_idx, (imgs, pids, _) in enumerate(trainloader):
+	
+    (imgs, pids, _) = next(iter(trainloader))
+    if use_gpu:
+        imgs, pids = imgs.cuda(), pids.cuda()
+    outputs, features = model(imgs)
+	
+    n = features.size(0) #args.htmn
+    # Compute pairwise distance, replace by the official when merged
+    dist = torch.pow(features, 2).sum(dim=1, keepdim=True).expand(n, n)
+    dist = dist + dist.t()
+    dist.addmm_(1, -2, features, features.t())
+    dist = dist.clamp(min=1e-12).sqrt()  # for numerical stability
+    mask = pids.expand(n, n).eq(pids.expand(n, n).t())
+    
+    #Compute losses for all triplets
+    
+    for batch_idx in range(args.htmk):
         # measure data loading time
         data_time.update(time.time() - end)
-
-        if use_gpu:
-            imgs, pids = imgs.cuda(), pids.cuda()
-        outputs, features = model(imgs)
+        
+        batch_indices = torch.randperm(args.htmn)[:args.batch_size]
+        
+        #for i in batch_indices:
+            # 5000 örnek için distance değil de tüm tripletler için loss hesaplanmalı
+            # hardest pos ve neg bulunmayacak, 25 highest loss bulunacak
+	
         if args.htri_only:
             if isinstance(features, tuple):
                 loss = DeepSupervision(criterion_htri, features, pids)
@@ -232,8 +266,8 @@ def train(epoch, model, criterion_xent, criterion_htri, optimizer, trainloader, 
                 htri_loss = DeepSupervision(criterion_htri, features, pids)
             else:
                 htri_loss = criterion_htri(features, pids)
-            
             loss = xent_loss + htri_loss
+		
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()

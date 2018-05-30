@@ -9,10 +9,13 @@ import zipfile
 import os.path as osp
 from scipy.io import loadmat
 import numpy as np
-import h5py
+import warnings
+with warnings.catch_warnings():
+    warnings.filterwarnings("ignore",category=FutureWarning)
+    import h5py
 from scipy.misc import imsave
 
-from utils import mkdir_if_missing, write_json, read_json
+from utils import * #mkdir_if_missing, write_json, read_json
 
 """Image ReID"""
 
