@@ -21,7 +21,7 @@ import models
 from losses import CrossEntropyLabelSmooth, TripletLoss, DeepSupervision, TripletLossDoneRight
 from utils import AverageMeter, Logger, save_checkpoint
 from eval_metrics import evaluate
-from samplers import RandomIdentitySampler, RandomSamplerDoneRight
+from samplers import RandomIdentitySampler
 from optimizers import init_optim
 
 parser = argparse.ArgumentParser(description='Train image model with cross entropy loss and hard triplet loss')
@@ -45,7 +45,7 @@ parser.add_argument('--use-metric-cuhk03', action='store_true',
                     help="whether to use cuhk03-metric (default: False)")
 # Optimization options
 parser.add_argument('--optim', type=str, default='adam', help="optimization algorithm (see optimizers.py)")
-parser.add_argument('--max-epoch', default=180, type=int,
+parser.add_argument('--max-epoch', default=256, type=int,
                     help="maximum epochs to run")
 parser.add_argument('--start-epoch', default=0, type=int,
                     help="manual epoch number (useful on restarts)")
@@ -66,7 +66,7 @@ parser.add_argument('--num-instances', type=int, default=4,
 parser.add_argument('--htri-only', action='store_true', default=False,
                     help="if this is True, only htri loss is used in training")
 # Hard Triplet Mining Options
-parser.add_argument('--htmn', default=64, type=int,
+parser.add_argument('--htmn', default=5000, type=int,
 					help="Number of randomly selected example images for hard triplet mining")
 parser.add_argument('--htmk', default=16, type=int,
 					help="Number of iterations with same example image set")
@@ -125,11 +125,11 @@ def main():
 
     pin_memory = True if use_gpu else False
 
-
     trainloader = DataLoader(
         ImageDataset(dataset.train, transform=transform_train),
-        sampler=RandomIdentitySampler(dataset.train, num_instances=args.num_instances),
-        batch_size=args.train_batch, num_workers=args.workers,
+        # sampler=RandomIdentitySampler(dataset.train, num_instances=args.num_instances),
+        shuffle=True,
+        batch_size=args.htmn, num_workers=args.workers,
         pin_memory=pin_memory, drop_last=True,
     )
     """
@@ -226,34 +226,49 @@ def train(epoch, model, criterion_xent, criterion_htri, optimizer, trainloader, 
 
     end = time.time()
 
+    n = args.htmn
+
     for _, (imgs, pids, _) in enumerate(trainloader):
 
-        # (imgs, pids, _) = next(iter(trainloader))
-        if use_gpu:
-            imgs, pids = imgs.cuda(), pids.cuda()
-        outputs, features = model(imgs)
+        # No need for grad calculation in hard triplet mining steps
+        with torch.no_grad():
+            if use_gpu:
+                imgs, pids = imgs.cuda(), pids.cuda()
 
-        n = features.size(0)  # args.htmn
-        # Compute pairwise distance, replace by the official when merged
-        dist = torch.pow(features, 2).sum(dim=1, keepdim=True).expand(n, n)
-        dist = dist + dist.t()
-        dist.addmm_(1, -2, features, features.t())
-        dist = dist.clamp(min=1e-12).sqrt()  # for numerical stability
-        mask = pids.expand(n, n).eq(pids.expand(n, n).t())
+            chunks = n // args.train_batch
+            features_list = []
+            for c in range(chunks):
+                img_chunk = imgs.narrow(0, c * args.train_batch, args.train_batch)
+                _, feat_chunk = model(img_chunk)
+                features_list.append(feat_chunk)
+            if chunks*args.train_batch < n:
+                img_chunk = imgs.narrow(0, chunks*args.train_batch, n - chunks*args.train_batch)
+                _, feat_chunk = model(img_chunk)
+                features_list.append(feat_chunk)
 
-        # Compute losses for all triplets
-        # This tensor holds loss like values
-        # Loss like = no margin, no max
-        # Invalid triplets are zero
-        # Lossless triplets are negative
-        # Lossy triplets are positive
-        loss_like = torch.zeros([n, n, n])
-        for anc in range(n):
-            for pos in range(n):
-                if mask[anc, pos] == 1 and anc != pos:
-                    for neg in range(n):
-                        if mask[anc, neg] == 0:
-                            loss_like[anc, pos, neg] = dist[anc][pos] - dist[anc][neg]
+            features = torch.cat(features_list)
+
+            # n = features.size(0)  # args.htmn
+            # Compute pairwise distance, replace by the official when merged
+            dist = torch.pow(features, 2).sum(dim=1, keepdim=True).expand(n, n)
+            dist = dist + dist.t()
+            dist.addmm_(1, -2, features, features.t())
+            dist = dist.clamp(min=1e-12).sqrt()  # for numerical stability
+            mask = pids.expand(n, n).eq(pids.expand(n, n).t())
+
+            # Compute losses for all triplets
+            # This tensor holds loss like values
+            # Loss like = no margin, no max
+            # Invalid triplets are zero
+            # Lossless triplets are zero
+            # Lossy triplets are positive
+            all_losses = torch.zeros([n, n, n])
+            for anc in range(n):
+                for pos in range(n):
+                    if mask[anc, pos] == 1 and anc != pos:
+                        for neg in range(n):
+                            if mask[anc, neg] == 0:
+                                all_losses[anc, pos, neg] = max(0, dist[anc][pos] - dist[anc][neg] + args.margin)
 
         for batch_idx in range(args.htmk):
             # measure data loading time
@@ -278,10 +293,50 @@ def train(epoch, model, criterion_xent, criterion_htri, optimizer, trainloader, 
                 loss = xent_loss + htri_loss
             """
 
-            loss = criterion_htri(dist, loss_like)
+            # No need for grad calculation in hard triplet mining steps
+            with torch.no_grad():
+                # Randomly select batch number of query images
+                batch_query_candidates = torch.randperm(n)[:args.train_batch]
+
+                batch_queries, batch_positives, batch_negatives = [], [], []
+                for q in batch_query_candidates:
+                    # For each query in batch, determine 25 triplets with highest loss
+                    vals, inds = torch.topk(all_losses[q].view([n * n]), 25)
+                    pos_inds, neg_inds = np.unravel_index(inds, (n, n))
+                    # Randomly pick one triplet among 25 triplets
+                    selected_idx = random.choice(range(25))
+                    while vals[selected_idx] <= 0 and selected_idx != 0:
+                        selected_idx = random.choice(range(selected_idx))
+                    if selected_idx == 0 and vals[selected_idx] <= 0:
+                        print("cont1")
+                        continue
+                    batch_queries.append(q)
+                    batch_positives.append(pos_inds[selected_idx])
+                    batch_negatives.append(neg_inds[selected_idx])
+
+                if len(batch_queries) < args.train_batch / 4:
+                    print("cont2")
+                    continue
+                batch_query_imgs = torch.index_select(imgs, 0, torch.cuda.LongTensor(batch_queries))
+                batch_pos_imgs = torch.index_select(imgs, 0, torch.cuda.LongTensor(batch_positives))
+                batch_neg_imgs = torch.index_select(imgs, 0, torch.cuda.LongTensor(batch_negatives))
+                # batch_pos_imgs = imgs[batch_positives]
+                # batch_neg_imgs = imgs[batch_negatives]
+
+                batch_imgs = torch.cat((batch_query_imgs, batch_pos_imgs, batch_neg_imgs), 0)
+
+            _, batch_features = model(batch_imgs)
+
+            """
+            _, batch_query_features = model(batch_query_imgs)
+            _, batch_pos_features = model(batch_pos_imgs)
+            _, batch_neg_features = model(batch_neg_imgs)
+            """
+
+            loss = criterion_htri(batch_features)
 
             optimizer.zero_grad()
-            loss.backward(retain_graph=True)
+            loss.backward()
             optimizer.step()
 
             # measure elapsed time
