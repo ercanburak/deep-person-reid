@@ -334,8 +334,8 @@ def compute_mask_dist(features, pids):
 def sample_triplet(mask, dist, anc):
     n = args.htmn
 
-    maskp = mask[anc, :].type(torch.FloatTensor).unsqueeze(1).expand(n, n)
-    maskn = (1 - mask[anc, :].type(torch.FloatTensor)).unsqueeze(0).expand(n, n)
+    maskp = mask[anc, :].type(torch.cuda.FloatTensor).unsqueeze(1).expand(n, n)
+    maskn = (1 - mask[anc, :].type(torch.cuda.FloatTensor)).unsqueeze(0).expand(n, n)
     maskLoss = maskp * maskn
     ap = dist[anc, :].unsqueeze(1).expand(n, n)
     an = dist[anc, :].unsqueeze(0).expand(n, n)
