@@ -49,7 +49,7 @@ parser.add_argument('--max-epoch', default=256, type=int,
                     help="maximum epochs to run")
 parser.add_argument('--start-epoch', default=0, type=int,
                     help="manual epoch number (useful on restarts)")
-parser.add_argument('--train-batch', default=32, type=int,
+parser.add_argument('--train-batch', default=18, type=int,
                     help="train batch size")
 parser.add_argument('--test-batch', default=32, type=int, help="test batch size")
 parser.add_argument('--lr', '--learning-rate', default=0.0003, type=float,
@@ -90,6 +90,12 @@ def main():
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_devices
     use_gpu = torch.cuda.is_available()
     if args.use_cpu: use_gpu = False
+    """
+    mask = torch.randint(0, 2, (50, 50))
+    dist = torch.rand(50, 50)
+    anc = random.choice(range(50))
+    sample_triplet(mask, dist, anc)
+    """
 
     if not args.evaluate:
         sys.stdout = Logger(osp.join(args.save_dir, 'log_train.txt'))
@@ -236,6 +242,7 @@ def train(epoch, model, criterion_xent, criterion_htri, optimizer, trainloader, 
                 imgs, pids = imgs.cuda(), pids.cuda()
 
             features = compute_features(model, imgs)
+            #features = torch.rand(args.htmn, 2048)
 
             mask, dist = compute_mask_dist(features, pids)
 
@@ -252,7 +259,10 @@ def train(epoch, model, criterion_xent, criterion_htri, optimizer, trainloader, 
                 for q in batch_query_candidates:
                     print('Sampling triplets, index: {0}/{1}\t'.format(index, args.train_batch))
                     index += 1
+                    #starttime = time.time()
                     result, pos, neg = sample_triplet(mask, dist, q)
+                    #endtime = time.time()
+                    #print(endtime - starttime)
                     if not result:
                         print("cont1")
                         continue
@@ -323,14 +333,25 @@ def compute_mask_dist(features, pids):
 
 def sample_triplet(mask, dist, anc):
     n = args.htmn
-    all_losses = torch.zeros([n, n])
+
+    maskp = mask[anc, :].type(torch.FloatTensor).unsqueeze(1).expand(n, n)
+    maskn = (1 - mask[anc, :].type(torch.FloatTensor)).unsqueeze(0).expand(n, n)
+    maskLoss = maskp * maskn
+    ap = dist[anc, :].unsqueeze(1).expand(n, n)
+    an = dist[anc, :].unsqueeze(0).expand(n, n)
+    loss_like = (ap - an) * maskLoss
+
+    """
+    loss_like = torch.zeros([n, n])
     for pos in range(n):
         if mask[anc][pos] == 1 and anc != pos:
             for neg in range(n):
                 if mask[anc, neg] == 0:
-                    all_losses[pos, neg] = max(0, dist[anc][pos] - dist[anc][neg] + args.margin)
+                    loss_like[pos, neg] = dist[anc][pos] - dist[anc][neg]
+    """
+
     # Determine 25 triplets with highest loss
-    vals, inds = torch.topk(all_losses.view([n * n]), 25)
+    vals, inds = torch.topk(loss_like.view([n * n]), 25)
     pos_inds, neg_inds = np.unravel_index(inds, (n, n))
     # Randomly pick one triplet among 25 triplets
     selected_idx = random.choice(range(25))
