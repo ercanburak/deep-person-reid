@@ -6,7 +6,6 @@ import datetime
 import argparse
 import os.path as osp
 import numpy as np
-import random
 
 import torch
 import torch.nn as nn
@@ -45,11 +44,11 @@ parser.add_argument('--use-metric-cuhk03', action='store_true',
                     help="whether to use cuhk03-metric (default: False)")
 # Optimization options
 parser.add_argument('--optim', type=str, default='adam', help="optimization algorithm (see optimizers.py)")
-parser.add_argument('--max-epoch', default=256, type=int,
+parser.add_argument('--max-epoch', default=32, type=int,
                     help="maximum epochs to run")
 parser.add_argument('--start-epoch', default=0, type=int,
                     help="manual epoch number (useful on restarts)")
-parser.add_argument('--train-batch', default=18, type=int,
+parser.add_argument('--train-batch', default=16, type=int,
                     help="train batch size")
 parser.add_argument('--test-batch', default=32, type=int, help="test batch size")
 parser.add_argument('--lr', '--learning-rate', default=0.0003, type=float,
@@ -92,12 +91,6 @@ def main():
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_devices
     use_gpu = torch.cuda.is_available()
     if args.use_cpu: use_gpu = False
-    """
-    mask = torch.randint(0, 2, (50, 50))
-    dist = torch.rand(50, 50)
-    anc = random.choice(range(50))
-    sample_triplet(mask, dist, anc)
-    """
 
     if not args.evaluate:
         sys.stdout = Logger(osp.join(args.save_dir, 'log_train.txt'))
@@ -147,15 +140,6 @@ def main():
             batch_size=args.train_batch, num_workers=args.workers,
             pin_memory=pin_memory, drop_last=True,
         )
-
-    """
-
-    trainloader = DataLoader(
-        ImageDataset(dataset.train, transform=transform_train),
-        batch_size=args.htmn, num_workers=args.workers, shuffle=True,
-        pin_memory=pin_memory, drop_last=True,
-    )
-    """
 
     queryloader = DataLoader(
         ImageDataset(dataset.query, transform=transform_test),
@@ -310,7 +294,7 @@ def train_done_right(epoch, model, criterion_xent, criterion_htri, optimizer, tr
                 imgs, pids = imgs.cuda(), pids.cuda()
 
             features = compute_features(model, imgs)
-            #features = torch.rand(args.htmn, 2048)
+            #features = torch.rand(args.htmn, 2048).cuda()
 
             mask, dist = compute_mask_dist(features, pids)
 
@@ -321,29 +305,14 @@ def train_done_right(epoch, model, criterion_xent, criterion_htri, optimizer, tr
             # No need for grad calculation in hard triplet mining steps
             with torch.no_grad():
                 # Randomly select batch number of query images
-                batch_query_candidates = torch.randperm(n)[:args.train_batch]
-                batch_queries, batch_positives, batch_negatives = [], [], []
-                index = 0
-                for q in batch_query_candidates:
-                    print('Sampling triplets, index: {0}/{1}\t'.format(index, args.train_batch))
-                    index += 1
-                    #starttime = time.time()
-                    result, pos, neg = sample_triplet(mask, dist, q)
-                    #endtime = time.time()
-                    #print(endtime - starttime)
-                    if not result:
-                        print("cont1")
-                        continue
-                    batch_queries.append(q)
-                    batch_positives.append(pos)
-                    batch_negatives.append(neg)
-
-                if len(batch_queries) < args.train_batch / 4:
-                    print("cont2")
-                    continue
-                batch_query_imgs = torch.index_select(imgs, 0, torch.cuda.LongTensor(batch_queries))
-                batch_pos_imgs = torch.index_select(imgs, 0, torch.cuda.LongTensor(batch_positives))
-                batch_neg_imgs = torch.index_select(imgs, 0, torch.cuda.LongTensor(batch_negatives))
+                batch_queries = torch.randperm(n)[:args.train_batch].cuda()
+                starttime = time.time()
+                batch_positives, batch_negatives = sample_triplet(mask, dist, batch_queries)
+                endtime = time.time()
+                print(endtime - starttime)
+                batch_query_imgs = torch.index_select(imgs, 0,  torch.cuda.LongTensor(batch_queries))
+                batch_pos_imgs = torch.index_select(imgs, 0, batch_positives)
+                batch_neg_imgs = torch.index_select(imgs, 0, batch_negatives)
                 batch_imgs = torch.cat((batch_query_imgs, batch_pos_imgs, batch_neg_imgs), 0)
 
             _, batch_features = model(batch_imgs)
@@ -391,44 +360,48 @@ def compute_features(model, imgs):
 def compute_mask_dist(features, pids):
     n = args.htmn
     # Compute pairwise distance, replace by the official when merged
-    dist = torch.pow(features, 2).sum(dim=1, keepdim=True).expand(n, n)
+    dist = torch.pow(features, 2).sum(dim=1, keepdim=True).expand(n, n).cuda()
     dist = dist + dist.t()
     dist.addmm_(1, -2, features, features.t())
     dist = dist.clamp(min=1e-12).sqrt()  # for numerical stability
-    mask = pids.expand(n, n).eq(pids.expand(n, n).t())
+    mask = pids.expand(n, n).eq(pids.expand(n, n).t()).cuda()
     return mask, dist
 
 
-def sample_triplet(mask, dist, anc):
-    n = args.htmn
-
-    maskp = mask[anc, :].type(torch.cuda.FloatTensor).unsqueeze(1).expand(n, n)
-    maskn = (1 - mask[anc, :].type(torch.cuda.FloatTensor)).unsqueeze(0).expand(n, n)
+def sample_triplet(mask, dist, queries):
+    n = mask.size(0)
+    b = len(queries)
+    maskp = mask[queries, :].type(torch.cuda.FloatTensor).unsqueeze(2).expand(b, n, n)
+    maskn = (1 - mask[queries, :].type(torch.cuda.FloatTensor)).unsqueeze(1).expand(b, n, n)
     maskLoss = maskp * maskn
-    ap = dist[anc, :].unsqueeze(1).expand(n, n)
-    an = dist[anc, :].unsqueeze(0).expand(n, n)
-    loss_like = (ap - an) * maskLoss
+    ap = dist[queries, :].unsqueeze(2).expand(b, n, n)
+    an = dist[queries, :].unsqueeze(1).expand(b, n, n)
+    loss_like = (ap - an)
+    loss_like = loss_like * maskLoss
 
     """
-    loss_like = torch.zeros([n, n])
-    for pos in range(n):
-        if mask[anc][pos] == 1 and anc != pos:
-            for neg in range(n):
-                if mask[anc, neg] == 0:
-                    loss_like[pos, neg] = dist[anc][pos] - dist[anc][neg]
+    loss_like2 = torch.zeros([b, n, n])
+    for anci, anc in enumerate(queries):
+        for pos in range(n):
+            if mask[anc][pos] == 1 and anc != pos:
+                for neg in range(n):
+                    if mask[anc, neg] == 0:
+                        loss_like2[anci, pos, neg] = dist[anc][pos] - dist[anc][neg]
+
     """
 
-    # Determine 25 triplets with highest loss
-    vals, inds = torch.topk(loss_like.view([n * n]), 25)
-    pos_inds, neg_inds = np.unravel_index(inds, (n, n))
-    # Randomly pick one triplet among 25 triplets
-    selected_idx = random.choice(range(25))
-    while vals[selected_idx] <= 0 and selected_idx != 0:
-        selected_idx = random.choice(range(selected_idx))
-    if selected_idx == 0 and vals[selected_idx] <= 0:
-        return False, 0, 0
-    else:
-        return True, pos_inds[selected_idx], neg_inds[selected_idx]
+    # Determine 25 triplets with highest loss for each query
+    vals, inds = torch.topk(loss_like.view(b, n * n), 25)
+    pos_inds, neg_inds = np.unravel_index(inds.view(b*25), (n, n))
+    pos_inds = torch.reshape(torch.tensor(pos_inds), (b, 25))
+    neg_inds = torch.reshape(torch.tensor(neg_inds), (b, 25))
+
+    # Randomly pick one triplet among 25 triplets for each query
+    selected_idx = torch.Tensor(np.random.choice(range(25), size=b)).long()
+    pos_inds = pos_inds.gather(1, selected_idx.view(-1, 1)).cuda().squeeze()
+    neg_inds = neg_inds.gather(1, selected_idx.view(-1, 1)).cuda().squeeze()
+
+    return pos_inds, neg_inds
 
 
 def test(model, queryloader, galleryloader, use_gpu, ranks=[1, 5, 10, 20]):
