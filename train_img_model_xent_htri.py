@@ -70,6 +70,7 @@ parser.add_argument('--htmn', default=5000, type=int,
 					help="Number of randomly selected example images for hard triplet mining")
 parser.add_argument('--htmk', default=16, type=int,
 					help="Number of iterations with same example image set")
+parser.add_argument('--done-right', action='store_true', help="person re-id done right")
 # Architecture
 parser.add_argument('-a', '--arch', type=str, default='resnet50', choices=models.get_names())
 # Miscs
@@ -77,8 +78,9 @@ parser.add_argument('--print-freq', type=int, default=10, help="print frequency"
 parser.add_argument('--seed', type=int, default=1, help="manual seed")
 parser.add_argument('--resume', type=str, default='', metavar='PATH')
 parser.add_argument('--evaluate', action='store_true', help="evaluation only")
-parser.add_argument('--eval-step', type=int, default=-1,
+parser.add_argument('--eval-step', type=int, default=16,
                     help="run evaluation for every N epochs (set to -1 to test after training)")
+parser.add_argument('--start-eval', type=int, default=128, help="start to evaluate after specific epoch")
 parser.add_argument('--save-dir', type=str, default='log')
 parser.add_argument('--use-cpu', action='store_true', help="use cpu")
 parser.add_argument('--gpu-devices', default='0', type=str, help='gpu device ids for CUDA_VISIBLE_DEVICES')
@@ -131,13 +133,21 @@ def main():
 
     pin_memory = True if use_gpu else False
 
-    trainloader = DataLoader(
-        ImageDataset(dataset.train, transform=transform_train),
-        # sampler=RandomIdentitySampler(dataset.train, num_instances=args.num_instances),
-        shuffle=True,
-        batch_size=args.htmn, num_workers=args.workers,
-        pin_memory=pin_memory, drop_last=True,
-    )
+    if args.done_right:
+        trainloader = DataLoader(
+            ImageDataset(dataset.train, transform=transform_train),
+            shuffle=True,
+            batch_size=args.htmn, num_workers=args.workers,
+            pin_memory=pin_memory, drop_last=True,
+        )
+    else:
+        trainloader = DataLoader(
+            ImageDataset(dataset.train, transform=transform_train),
+            sampler=RandomIdentitySampler(dataset.train, num_instances=args.num_instances),
+            batch_size=args.train_batch, num_workers=args.workers,
+            pin_memory=pin_memory, drop_last=True,
+        )
+
     """
 
     trainloader = DataLoader(
@@ -164,8 +174,10 @@ def main():
     print("Model size: {:.5f}M".format(sum(p.numel() for p in model.parameters())/1000000.0))
 
     criterion_xent = CrossEntropyLabelSmooth(num_classes=dataset.num_train_pids, use_gpu=use_gpu)
-    criterion_htri = TripletLossDoneRight(margin=args.margin, bs=args.train_batch)
-
+    if args.done_right:
+        criterion_htri = TripletLossDoneRight(margin=args.margin, bs=args.train_batch)
+    else:
+        criterion_htri = TripletLoss(margin=args.margin)
     optimizer = init_optim(args.optim, model.parameters(), args.lr, args.weight_decay)
     if args.stepsize > 0:
         scheduler = lr_scheduler.StepLR(optimizer, step_size=args.stepsize, gamma=args.gamma)
@@ -193,12 +205,15 @@ def main():
 
     for epoch in range(start_epoch, args.max_epoch):
         start_train_time = time.time()
-        train(epoch, model, criterion_xent, criterion_htri, optimizer, trainloader, use_gpu)
+        if args.done_right:
+            train_done_right(epoch, model, criterion_xent, criterion_htri, optimizer, trainloader, use_gpu)
+        else:
+            train(epoch, model, criterion_xent, criterion_htri, optimizer, trainloader, use_gpu)
         train_time += round(time.time() - start_train_time)
 
         if args.stepsize > 0: scheduler.step()
 
-        if args.eval_step > 0 and (epoch+1) % args.eval_step == 0 or (epoch+1) == args.max_epoch:
+        if (epoch + 1) > args.start_eval and args.eval_step > 0 and (epoch + 1) % args.eval_step == 0 or (epoch + 1) == args.max_epoch:
             print("==> Test")
             rank1 = test(model, queryloader, galleryloader, use_gpu)
             is_best = rank1 > best_rank1
@@ -223,7 +238,60 @@ def main():
     train_time = str(datetime.timedelta(seconds=train_time))
     print("Finished. Total elapsed time (h:m:s): {}. Training time (h:m:s): {}.".format(elapsed, train_time))
 
+
 def train(epoch, model, criterion_xent, criterion_htri, optimizer, trainloader, use_gpu):
+    losses = AverageMeter()
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+
+    model.train()
+
+    end = time.time()
+    for batch_idx, (imgs, pids, _) in enumerate(trainloader):
+        if use_gpu:
+            imgs, pids = imgs.cuda(), pids.cuda()
+
+        # measure data loading time
+        data_time.update(time.time() - end)
+
+        outputs, features = model(imgs)
+        if args.htri_only:
+            if isinstance(features, tuple):
+                loss = DeepSupervision(criterion_htri, features, pids)
+            else:
+                loss = criterion_htri(features, pids)
+        else:
+            if isinstance(outputs, tuple):
+                xent_loss = DeepSupervision(criterion_xent, outputs, pids)
+            else:
+                xent_loss = criterion_xent(outputs, pids)
+
+            if isinstance(features, tuple):
+                htri_loss = DeepSupervision(criterion_htri, features, pids)
+            else:
+                htri_loss = criterion_htri(features, pids)
+
+            loss = xent_loss + htri_loss
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        losses.update(loss.item(), pids.size(0))
+
+        if (batch_idx + 1) % args.print_freq == 0:
+            print('Epoch: [{0}][{1}/{2}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'.format(
+                epoch + 1, batch_idx + 1, len(trainloader), batch_time=batch_time,
+                data_time=data_time, loss=losses))
+
+
+def train_done_right(epoch, model, criterion_xent, criterion_htri, optimizer, trainloader, use_gpu):
     losses = AverageMeter()
     batch_time = AverageMeter()
     data_time = AverageMeter()
