@@ -43,23 +43,23 @@ parser.add_argument('--cuhk03-classic-split', action='store_true',
 parser.add_argument('--use-metric-cuhk03', action='store_true',
                     help="whether to use cuhk03-metric (default: False)")
 # Optimization options
-parser.add_argument('--optim', type=str, default='adam', help="optimization algorithm (see optimizers.py)")
-parser.add_argument('--max-epoch', default=32, type=int,
+parser.add_argument('--optim', type=str, default='sgd', help="optimization algorithm (see optimizers.py)")
+parser.add_argument('--max-epoch', default=256, type=int,
                     help="maximum epochs to run")
 parser.add_argument('--start-epoch', default=0, type=int,
                     help="manual epoch number (useful on restarts)")
-parser.add_argument('--train-batch', default=16, type=int,
+parser.add_argument('--train-batch', default=8, type=int,
                     help="train batch size")
 parser.add_argument('--test-batch', default=32, type=int, help="test batch size")
-parser.add_argument('--lr', '--learning-rate', default=0.0003, type=float,
+parser.add_argument('--lr', '--learning-rate', default=0.001, type=float,
                     help="initial learning rate")
-parser.add_argument('--stepsize', default=60, type=int,
+parser.add_argument('--stepsize', default=32, type=int,
                     help="stepsize to decay learning rate (>0 means this is enabled)")
-parser.add_argument('--gamma', default=0.1, type=float,
+parser.add_argument('--gamma', default=0.5, type=float,
                     help="learning rate decay")
-parser.add_argument('--weight-decay', default=5e-04, type=float,
-                    help="weight decay (default: 5e-04)")
-parser.add_argument('--margin', type=float, default=0.3, help="margin for triplet loss")
+parser.add_argument('--weight-decay', default=5e-05, type=float,
+                    help="weight decay (default: 5e-05)")
+parser.add_argument('--margin', type=float, default=0.1, help="margin for triplet loss")
 parser.add_argument('--num-instances', type=int, default=4,
                     help="number of instances per identity")
 parser.add_argument('--htri-only', action='store_true', default=False,
@@ -306,10 +306,10 @@ def train_done_right(epoch, model, criterion_xent, criterion_htri, optimizer, tr
             with torch.no_grad():
                 # Randomly select batch number of query images
                 batch_queries = torch.randperm(n)[:args.train_batch].cuda()
-                starttime = time.time()
+                #starttime = time.time()
                 batch_positives, batch_negatives = sample_triplet(mask, dist, batch_queries)
-                endtime = time.time()
-                print(endtime - starttime)
+                #endtime = time.time()
+                #print(endtime - starttime)
                 batch_query_imgs = torch.index_select(imgs, 0,  torch.cuda.LongTensor(batch_queries))
                 batch_pos_imgs = torch.index_select(imgs, 0, batch_positives)
                 batch_neg_imgs = torch.index_select(imgs, 0, batch_negatives)
@@ -347,7 +347,7 @@ def compute_features(model, imgs):
         img_chunk = imgs.narrow(0, c * args.train_batch, args.train_batch)
         _, feat_chunk = model(img_chunk)
         features_list.append(feat_chunk)
-        print('Feature calculation, chunk: {0}/{1}\t'.format(c, chunks))
+        #print('Feature calculation, chunk: {0}/{1}\t'.format(c, chunks))
     if chunks * args.train_batch < n:
         img_chunk = imgs.narrow(0, chunks * args.train_batch, n - chunks * args.train_batch)
         _, feat_chunk = model(img_chunk)
