@@ -98,61 +98,6 @@ class TripletLoss(nn.Module):
         loss = self.ranking_loss(dist_an, dist_ap, y)
         return loss
 
-"""
-class TripletLossDoneRight(nn.Module):
-    Triplet loss as in Re-ID done right.
-
-    1) N random examples are selected (Same N examples are used for k iterations)
-    2) Loss is computed for all possible triplets
-    3) One image is randomly selected as query
-    4) 25 triplets with the highest loss are determined
-    5) One triplet is randomly selected among 25 triplets
-
-    Reference:
-    Almazan et al. Re-ID done right: towards good practices for person re-identification. arXiv:1801.05339.
-
-    Args:
-        margin (float): margin for triplet.
-        bs: batch size
-    
-    def __init__(self, margin=0.1, bs=32):
-        super(TripletLossDoneRight, self).__init__()
-        self.margin = margin
-        self.batch_size = bs
-        self.ranking_loss = nn.MarginRankingLoss(margin=margin)
-
-    def forward(self, dist, loss_like):
- 
-        Args:
-            dist: dist matrix with shape (htmn, htmn)
-            loss_like: has shape (htmn, htmn, htmn)
-
-
-        n = dist.size(0)  # args.htmn
-
-        # Randomly select batch number of query images
-        batch_queries = torch.randperm(n)[:self.batch_size]
-
-        dist_ap, dist_an = [], []
-
-        for q in batch_queries:
-            # For each query in batch, determine 25 triplets with highest loss
-            vals, inds = torch.topk(loss_like[q].view([n * n]), 25)
-            pos_inds, neg_inds = np.unravel_index(inds, (n, n))
-            # Randomly pick one triplet among 25 triplets
-            selected_idx = random.choice(range(25))
-            # Add that triplet to the batch triplets
-            dist_ap.append(dist[q][pos_inds[selected_idx]].unsqueeze(0))
-            dist_an.append(dist[q][neg_inds[selected_idx]].unsqueeze(0))
-
-        dist_ap = torch.cat(dist_ap)
-        dist_an = torch.cat(dist_an)
-        # Compute ranking hinge loss
-        y = torch.ones_like(dist_an)
-        loss = self.ranking_loss(dist_an, dist_ap, y)
-        return loss
-"""
-
 
 class TripletLossDoneRight(nn.Module):
     """Triplet loss as in Re-ID done right.
