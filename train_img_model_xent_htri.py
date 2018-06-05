@@ -44,16 +44,16 @@ parser.add_argument('--use-metric-cuhk03', action='store_true',
                     help="whether to use cuhk03-metric (default: False)")
 # Optimization options
 parser.add_argument('--optim', type=str, default='sgd', help="optimization algorithm (see optimizers.py)")
-parser.add_argument('--max-epoch', default=256, type=int,
+parser.add_argument('--max-epoch', default=512, type=int,
                     help="maximum epochs to run")
 parser.add_argument('--start-epoch', default=0, type=int,
                     help="manual epoch number (useful on restarts)")
-parser.add_argument('--train-batch', default=8, type=int,
+parser.add_argument('--train-batch', default=12, type=int,
                     help="train batch size")
 parser.add_argument('--test-batch', default=32, type=int, help="test batch size")
-parser.add_argument('--lr', '--learning-rate', default=0.001, type=float,
+parser.add_argument('--lr', '--learning-rate', default=0.0002, type=float,
                     help="initial learning rate")
-parser.add_argument('--stepsize', default=32, type=int,
+parser.add_argument('--stepsize', default=16, type=int,
                     help="stepsize to decay learning rate (>0 means this is enabled)")
 parser.add_argument('--gamma', default=0.5, type=float,
                     help="learning rate decay")
@@ -67,13 +67,15 @@ parser.add_argument('--htri-only', action='store_true', default=False,
 # Hard Triplet Mining Options
 parser.add_argument('--htmn', default=5000, type=int,
 					help="Number of randomly selected example images for hard triplet mining")
-parser.add_argument('--htmk', default=16, type=int,
+parser.add_argument('--htmk', default=32, type=int,
 					help="Number of iterations with same example image set")
+parser.add_argument('--htms', default=25, type=int,
+					help="Number of samples for each query")
 parser.add_argument('--done-right', action='store_true', help="person re-id done right")
 # Architecture
 parser.add_argument('-a', '--arch', type=str, default='resnet50', choices=models.get_names())
 # Miscs
-parser.add_argument('--print-freq', type=int, default=10, help="print frequency")
+parser.add_argument('--print-freq', type=int, default=8, help="print frequency")
 parser.add_argument('--seed', type=int, default=1, help="manual seed")
 parser.add_argument('--resume', type=str, default='', metavar='PATH')
 parser.add_argument('--evaluate', action='store_true', help="evaluation only")
@@ -129,6 +131,7 @@ def main():
     if args.done_right:
         trainloader = DataLoader(
             ImageDataset(dataset.train, transform=transform_train),
+            # sampler=RandomIdentitySampler(dataset.train, num_instances=args.num_instances),
             shuffle=True,
             batch_size=args.htmn, num_workers=args.workers,
             pin_memory=pin_memory, drop_last=True,
@@ -275,6 +278,13 @@ def train(epoch, model, criterion_xent, criterion_htri, optimizer, trainloader, 
                 data_time=data_time, loss=losses))
 
 
+def myPrint(tensor):
+    print('Shape:{0}'.format(tensor.shape))
+    print('Device:{0}'.format(tensor.device))
+    print('Type:{0}'.format(tensor.dtype))
+    print('Grad:{0}'.format(tensor.requires_grad))
+
+    
 def train_done_right(epoch, model, criterion_xent, criterion_htri, optimizer, trainloader, use_gpu):
     losses = AverageMeter()
     batch_time = AverageMeter()
@@ -297,6 +307,7 @@ def train_done_right(epoch, model, criterion_xent, criterion_htri, optimizer, tr
             #features = torch.rand(args.htmn, 2048).cuda()
 
             mask, dist = compute_mask_dist(features, pids)
+            del features
 
         for batch_idx in range(args.htmk):
             # measure data loading time
@@ -314,8 +325,12 @@ def train_done_right(epoch, model, criterion_xent, criterion_htri, optimizer, tr
                 batch_pos_imgs = torch.index_select(imgs, 0, batch_positives)
                 batch_neg_imgs = torch.index_select(imgs, 0, batch_negatives)
                 batch_imgs = torch.cat((batch_query_imgs, batch_pos_imgs, batch_neg_imgs), 0)
+                #del batch_query_imgs
+                #del batch_pos_imgs
+                #del batch_query_imgs
 
             _, batch_features = model(batch_imgs)
+            #del batch_imgs
 
             loss = criterion_htri(batch_features)
 
@@ -374,10 +389,15 @@ def sample_triplet(mask, dist, queries):
     maskp = mask[queries, :].type(torch.cuda.FloatTensor).unsqueeze(2).expand(b, n, n)
     maskn = (1 - mask[queries, :].type(torch.cuda.FloatTensor)).unsqueeze(1).expand(b, n, n)
     maskLoss = maskp * maskn
+    #del maskp
+    #del maskn
     ap = dist[queries, :].unsqueeze(2).expand(b, n, n)
     an = dist[queries, :].unsqueeze(1).expand(b, n, n)
     loss_like = (ap - an)
+    #del ap
+    #del an
     loss_like = loss_like * maskLoss
+    #del maskLoss
 
     """
     loss_like2 = torch.zeros([b, n, n])
@@ -387,17 +407,17 @@ def sample_triplet(mask, dist, queries):
                 for neg in range(n):
                     if mask[anc, neg] == 0:
                         loss_like2[anci, pos, neg] = dist[anc][pos] - dist[anc][neg]
-
     """
 
+
     # Determine 25 triplets with highest loss for each query
-    vals, inds = torch.topk(loss_like.view(b, n * n), 25)
-    pos_inds, neg_inds = np.unravel_index(inds.view(b*25), (n, n))
-    pos_inds = torch.reshape(torch.tensor(pos_inds), (b, 25))
-    neg_inds = torch.reshape(torch.tensor(neg_inds), (b, 25))
+    vals, inds = torch.topk(loss_like.view(b, n * n), args.htms)
+    pos_inds, neg_inds = np.unravel_index(inds.view(b*args.htms), (n, n))
+    pos_inds = torch.reshape(torch.tensor(pos_inds), (b, args.htms))
+    neg_inds = torch.reshape(torch.tensor(neg_inds), (b, args.htms))
 
     # Randomly pick one triplet among 25 triplets for each query
-    selected_idx = torch.Tensor(np.random.choice(range(25), size=b)).long()
+    selected_idx = torch.Tensor(np.random.choice(range(args.htms), size=b)).long()
     pos_inds = pos_inds.gather(1, selected_idx.view(-1, 1)).cuda().squeeze()
     neg_inds = neg_inds.gather(1, selected_idx.view(-1, 1)).cuda().squeeze()
 
