@@ -23,6 +23,9 @@ from eval_metrics import evaluate
 from samplers import RandomIdentitySampler
 from optimizers import init_optim
 
+import psutil
+import gc
+
 parser = argparse.ArgumentParser(description='Train image model with cross entropy loss and hard triplet loss')
 # Datasets
 parser.add_argument('--root', type=str, default='data', help="root path to data directory")
@@ -81,12 +84,29 @@ parser.add_argument('--resume', type=str, default='', metavar='PATH')
 parser.add_argument('--evaluate', action='store_true', help="evaluation only")
 parser.add_argument('--eval-step', type=int, default=16,
                     help="run evaluation for every N epochs (set to -1 to test after training)")
-parser.add_argument('--start-eval', type=int, default=128, help="start to evaluate after specific epoch")
+parser.add_argument('--start-eval', type=int, default=1, help="start to evaluate after specific epoch")
 parser.add_argument('--save-dir', type=str, default='log')
 parser.add_argument('--use-cpu', action='store_true', help="use cpu")
 parser.add_argument('--gpu-devices', default='0', type=str, help='gpu device ids for CUDA_VISIBLE_DEVICES')
 
 args = parser.parse_args()
+
+
+def memReport():
+    for obj in gc.get_objects():
+        if torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data)):
+            print(type(obj), obj.size())
+
+
+def cpuStats():
+    print(sys.version)
+    print(psutil.cpu_percent())
+    print(psutil.virtual_memory())  # physical memory usage
+    pid = os.getpid()
+    py = psutil.Process(pid)
+    memoryUse = py.memory_info()[0] / 2. ** 30  # memory use in GB...I think
+    print('memory GB:', memoryUse)
+
 
 def main():
     torch.manual_seed(args.seed)
@@ -241,7 +261,7 @@ def train(epoch, model, criterion_xent, criterion_htri, optimizer, trainloader, 
         # measure data loading time
         data_time.update(time.time() - end)
 
-        outputs, features = model(imgs)
+        outputs, features, _ = model(imgs)
         if args.htri_only:
             if isinstance(features, tuple):
                 loss = DeepSupervision(criterion_htri, features, pids)
@@ -303,12 +323,15 @@ def train_done_right(epoch, model, criterion_xent, criterion_htri, optimizer, tr
             if use_gpu:
                 imgs, pids = imgs.cuda(), pids.cuda()
 
-            features = compute_features(model, imgs)
+            features, norms_mean = compute_features(model, imgs)
             #features = torch.rand(args.htmn, 2048).cuda()
 
             mask, dist = compute_mask_dist(features, pids)
             del features
 
+            dist_mean = dist.mean()
+
+        percentages_list = []
         for batch_idx in range(args.htmk):
             # measure data loading time
             data_time.update(time.time() - end)
@@ -318,7 +341,8 @@ def train_done_right(epoch, model, criterion_xent, criterion_htri, optimizer, tr
                 # Randomly select batch number of query images
                 batch_queries = torch.randperm(n)[:args.train_batch].cuda()
                 #starttime = time.time()
-                batch_positives, batch_negatives = sample_triplet(mask, dist, batch_queries)
+                batch_positives, batch_negatives, percentage = sample_triplet(mask, dist, batch_queries)
+                percentages_list.append(percentage)
                 #endtime = time.time()
                 #print(endtime - starttime)
                 batch_query_imgs = torch.index_select(imgs, 0,  torch.cuda.LongTensor(batch_queries))
@@ -329,7 +353,7 @@ def train_done_right(epoch, model, criterion_xent, criterion_htri, optimizer, tr
                 #del batch_pos_imgs
                 #del batch_query_imgs
 
-            _, batch_features = model(batch_imgs)
+            _, batch_features, _ = model(batch_imgs)
             #del batch_imgs
 
             loss = criterion_htri(batch_features)
@@ -351,6 +375,12 @@ def train_done_right(epoch, model, criterion_xent, criterion_htri, optimizer, tr
                       'Loss {loss.val:.4f} ({loss.avg:.4f})\t'.format(
                        epoch+1, batch_idx+1, args.htmk, batch_time=batch_time,
                        data_time=data_time, loss=losses))
+
+        avg_perc = sum(percentages_list) / float(len(percentages_list))
+        print('Epoch: [{}]\t'
+              'Percentages: {:0.4f} \t'
+              'Norms Mean: {:.4f} \t'
+              'Distances: {:.4f}'.format(epoch + 1, avg_perc, norms_mean, dist_mean))
         break
 
 
@@ -358,18 +388,22 @@ def compute_features(model, imgs):
     n = args.htmn
     chunks = n // args.train_batch
     features_list = []
+    norms_list = []
     for c in range(chunks):
         img_chunk = imgs.narrow(0, c * args.train_batch, args.train_batch)
-        _, feat_chunk = model(img_chunk)
-        features_list.append(feat_chunk)
+        _, feat_chunk, norms = model(img_chunk)
+        features_list.append(feat_chunk.type(torch.cuda.HalfTensor))
+        norms_list.extend(norms)
         #print('Feature calculation, chunk: {0}/{1}\t'.format(c, chunks))
     if chunks * args.train_batch < n:
         img_chunk = imgs.narrow(0, chunks * args.train_batch, n - chunks * args.train_batch)
-        _, feat_chunk = model(img_chunk)
-        features_list.append(feat_chunk)
+        _, feat_chunk, nm = model(img_chunk)
+        features_list.append(feat_chunk.type(torch.cuda.HalfTensor))
+        norms_list.extend(nm)
 
+    norms_mean = sum(norms_list) / float(len(norms_list))
     features = torch.cat(features_list)
-    return features
+    return features, norms_mean
 
 
 def compute_mask_dist(features, pids):
@@ -386,8 +420,8 @@ def compute_mask_dist(features, pids):
 def sample_triplet(mask, dist, queries):
     n = mask.size(0)
     b = len(queries)
-    maskp = mask[queries, :].type(torch.cuda.FloatTensor).unsqueeze(2).expand(b, n, n)
-    maskn = (1 - mask[queries, :].type(torch.cuda.FloatTensor)).unsqueeze(1).expand(b, n, n)
+    maskp = mask[queries, :].type(torch.cuda.HalfTensor).unsqueeze(2).expand(b, n, n)
+    maskn = (1 - mask[queries, :].type(torch.cuda.HalfTensor)).unsqueeze(1).expand(b, n, n)
     maskLoss = maskp * maskn
     #del maskp
     #del maskn
@@ -396,7 +430,12 @@ def sample_triplet(mask, dist, queries):
     loss_like = (ap - an)
     #del ap
     #del an
+
+    # Number of valid triplets
+    num_valid = torch.nonzero(maskLoss.view(b * n * n)).size(0)
+
     loss_like = loss_like * maskLoss
+    loss_like[loss_like < 0] = 0
     #del maskLoss
 
     """
@@ -407,8 +446,17 @@ def sample_triplet(mask, dist, queries):
                 for neg in range(n):
                     if mask[anc, neg] == 0:
                         loss_like2[anci, pos, neg] = dist[anc][pos] - dist[anc][neg]
+
+    loss_like2[loss_like2<0] = 0
+
+    # Number of non-zero (active) triplets
+    num_active2 = torch.nonzero(loss_like2.view(b * n * n)).size(0)
     """
 
+    # Number of non-zero (active) triplets
+    num_active = torch.nonzero(loss_like.view(b * n * n)).size(0)
+
+    percentage = num_active / float(num_valid)
 
     # Determine 25 triplets with highest loss for each query
     vals, inds = torch.topk(loss_like.view(b, n * n), args.htms)
@@ -421,7 +469,7 @@ def sample_triplet(mask, dist, queries):
     pos_inds = pos_inds.gather(1, selected_idx.view(-1, 1)).cuda().squeeze()
     neg_inds = neg_inds.gather(1, selected_idx.view(-1, 1)).cuda().squeeze()
 
-    return pos_inds, neg_inds
+    return pos_inds, neg_inds, percentage
 
 
 def test(model, queryloader, galleryloader, use_gpu, ranks=[1, 5, 10, 20]):
