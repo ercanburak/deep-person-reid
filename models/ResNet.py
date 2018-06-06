@@ -31,6 +31,7 @@ class ResNet50(nn.Module):
         x = self.fully_connected(x)
 
         # L2 Normalization
+        norms = x.norm(dim=1)
         f = F.normalize(x)
 
         if not self.training:
@@ -40,7 +41,7 @@ class ResNet50(nn.Module):
         if self.loss == {'xent'}:
             return y
         elif self.loss == {'xent', 'htri'}:
-            return y, f
+            return y, f, norms
         elif self.loss == {'cent'}:
             return y, f
         elif self.loss == {'ring'}:
